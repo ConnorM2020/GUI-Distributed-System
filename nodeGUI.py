@@ -6,6 +6,7 @@ import time
 import random
 import csv
 import sys
+from node import Node
 from node import Node, Transaction
 from tkinter import filedialog
 
@@ -42,7 +43,7 @@ class NodeGUI:
         txn_frame = tk.LabelFrame(self.master, text="Transactions", padx=5, pady=5)
         txn_frame.pack(fill="x", padx=10, pady=5)
         tk.Button(txn_frame, text="Send Transaction", command=self.send_transaction).pack(side="left", padx=5, pady=5)
-        tk.Button(txn_frame, text="Send Custom Transaction", command=self.send_custom_transaction).pack(side="left", padx=5, pady=5)
+        tk.Button(txn_frame, text="Send Custom Transaction", command=self.send_custom_transaction_gui).pack(side="left", padx=5, pady=5)
         tk.Button(txn_frame, text="List Transactions", command=self.list_transactions).pack(side="left", padx=5, pady=5)
         tk.Button(txn_frame, text="Synchronize Transactions", command=self.synchronize_transactions).pack(side="left", padx=5, pady=5)
         tk.Button(txn_frame, text="Export Transactions", command=self.export_data).pack(side="left", padx=5, pady=5)
@@ -89,7 +90,7 @@ class NodeGUI:
     
     def get_balances(self):
         return self.balances
-
+    
     def show_balances(self):
         balances = self.get_balances()
         formatted = "\n".join([f"{node}: {balance:.2f}" for node, balance in balances.items()])
@@ -102,17 +103,29 @@ class NodeGUI:
     def display_transactions(self, transactions):
         table_window = tk.Toplevel(self.master)
         table_window.title("Transactions")
-        tree = Treeview(table_window, columns=("ID", "Sender", "Receiver", "Amount", "Timestamp"), show="headings")
+
+        tree = Treeview(
+            table_window,
+            columns=("ID", "Sender", "Receiver", "Amount", "Timestamp", "Custom Fields"),
+            show="headings"
+        )
         tree.pack(fill="both", expand=True)
+
         tree.heading("ID", text="Transaction ID")
         tree.heading("Sender", text="Sender")
         tree.heading("Receiver", text="Receiver")
         tree.heading("Amount", text="Amount")
         tree.heading("Timestamp", text="Timestamp")
-        
+        tree.heading("Custom Fields", text="Custom Fields")
+
         for txn in transactions:
-            tree.insert("", tk.END, values=(txn.id, txn.sender, txn.receiver, txn.amount, txn.timestamp))
-     
+            # Convert custom fields to string for display
+            custom_fields_str = ", ".join(f"{k}: {v}" for k, v in txn.custom_fields.items()) if txn.custom_fields else "None"
+            tree.insert("", tk.END, values=(txn.id, txn.sender, txn.receiver, txn.amount, txn.timestamp, custom_fields_str))
+
+        tk.Button(table_window, text="Close", command=table_window.destroy).pack(pady=5)
+
+
     def retrieve_transaction_by_index(self):
         try:
             # Get the transaction index from the user
@@ -186,63 +199,53 @@ class NodeGUI:
         else:
             self.log_message("No transactions found.")
 
-    def send_custom_transaction(self):
-        # Prompt the user for the receiver
+    def send_custom_transaction_gui(self):
         receiver = simpledialog.askstring("Send Custom Transaction", "Enter receiver address:")
         if not receiver:
             return
-
-        # Prompt the user for the amount
         try:
             amount = float(simpledialog.askstring("Send Custom Transaction", "Enter amount:"))
+            custom_fields = {}
+
+            # Ask for custom fields in a loop
+            while True:
+                custom_key = simpledialog.askstring("Custom Field Key", "Enter custom field key (or leave blank to finish):")
+                if not custom_key:
+                    break
+                custom_value = simpledialog.askstring("Custom Field Value", f"Enter value for {custom_key}:")
+                if custom_value is not None:
+                    custom_fields[custom_key] = custom_value  # Add key-value pair to the dictionary
+
+            print(f"Custom fields being sent: {custom_fields}")  # Debugging: Check custom fields
+
+            # Call the backend method to send the custom transaction
+            self.node.send_custom_transaction(receiver, amount, **custom_fields)
+            self.log_message(f"Custom transaction sent to {receiver} with {amount} and custom fields {custom_fields}.")
         except ValueError:
             self.log_message("Invalid amount entered.")
-            return
 
-        # Prompt the user for custom fields
-        custom_fields = {}
-        while True:
-            key = simpledialog.askstring("Custom Field", "Enter custom field name (or leave blank to finish):")
-            if not key:
-                break
-            value = simpledialog.askstring("Custom Field", f"Enter value for '{key}':")
-            if value:
-                custom_fields[key] = value
-
-        # Create and send the transaction
-        try:
-            transaction = Transaction(
-                sender=self.node.address,
-                receiver=receiver,
-                amount=amount,
-                **custom_fields  # Pass custom fields as additional arguments
-            )
-            self.node.broadcast_transaction(transaction)
-            self.log_message(f"Custom transaction sent: {transaction.to_dict()}")
-        except Exception as e:
-            self.log_message(f"Error sending custom transaction: {e}")
 
     def synchronize_transactions(self):
-        self.node.synchronize_transactions()
-        self.log_message("Synchronized transactions with peers.")
-    
+            self.node.synchronize_transactions()
+            self.log_message("Synchronized transactions with peers.")
+        
     def remove_peer(self):
-        """Remove a peer and close the GUI if the node is being removed."""
-        peer = simpledialog.askstring("Remove Peer", "Enter peer address (IP:PORT):")
-        if peer in self.node.peers:
-            self.node.remove_peer(peer)
-            self.log_message(f"Removed peer: {peer}")
+            """Remove a peer and close the GUI if the node is being removed."""
+            peer = simpledialog.askstring("Remove Peer", "Enter peer address (IP:PORT):")
+            if peer in self.node.peers:
+                self.node.remove_peer(peer)
+                self.log_message(f"Removed peer: {peer}")
 
-            # If the current node is being removed, stop and close the window
-            if peer == self.node.address:
-                self.log_message("Node is being removed. Closing GUI.")
-                self.node.stop()  # Stop the node's operations
-            if hasattr(self.master, 'destroy'):
-                self.master.destroy()  # Destroy the main Tkinter window
-            elif hasattr(self.master, 'quit'):
-                self.master.quit()  # Fallback to quit if destroy is unavailable
-        else:
-            self.log_message(f"Peer not found: {peer}")
+                # If the current node is being removed, stop and close the window
+                if peer == self.node.address:
+                    self.log_message("Node is being removed. Closing GUI.")
+                    self.node.stop()  # Stop the node's operations
+                if hasattr(self.master, 'destroy'):
+                    self.master.destroy()  # Destroy the main Tkinter window
+                elif hasattr(self.master, 'quit'):
+                    self.master.quit()  # Fallback to quit if destroy is unavailable
+            else:
+                self.log_message(f"Peer not found: {peer}")
 
     def remove_current_node(self):
         """Remove the current node and close the GUI."""

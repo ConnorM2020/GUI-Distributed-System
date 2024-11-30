@@ -15,25 +15,33 @@ import time
 # def log_message(message_type, details):
 #     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {message_type}: {details}")
 
-
 class Transaction:
-    def __init__(self, txn_id=None, amount=None, sender=None, receiver=None, **kwargs):
+    def __init__(self, txn_id=None, amount=None, sender=None, receiver=None, **custom_fields):
         self.id = txn_id or str(uuid.uuid4())
         self.amount = amount
         self.sender = sender
         self.receiver = receiver
         self.timestamp = datetime.now().isoformat()
+        self.custom_fields = custom_fields
         
 
     def to_dict(self):
-        return {
+        base_dict = {
             "id": self.id,
             "amount": self.amount,
             "sender": self.sender,
             "receiver": self.receiver,
             "timestamp": self.timestamp,
         }
+        return {**base_dict, "custom_fields": self.custom_fields}
 
+    @classmethod
+    def from_dict(cls, data):
+        # Separate custom fields from the required fields
+        required_fields = {"id", "amount", "sender", "receiver", "timestamp"}
+        base_data = {key: data[key] for key in required_fields if key in data}
+        custom_data = data.get("custom_fields", {})
+        return cls(**base_data, **custom_data)
 
 class Node:
     def __init__(self, nickname, address, log_callback=None):
@@ -184,6 +192,61 @@ class Node:
         else:
             self.log("Error", f"Failed to send transaction to {receiver_address}")
 
+    def send_custom_transaction(self, receiver_address, amount, **custom_fields):
+        if receiver_address == self.address:
+            self.log("Error", "Cannot send transaction to self.")
+            return
+
+        if receiver_address not in self.peers:
+            self.log("Error", f"Cannot send transaction: {receiver_address} is not a peer.")
+            return
+
+        if self.address not in self.balances or self.balances[self.address] < amount:
+            self.log("Error", "Insufficient balance.")
+            return
+
+        # Validate custom fields to ensure no conflicts
+        reserved_fields = {"id", "amount", "sender", "receiver", "timestamp"}
+        invalid_keys = reserved_fields.intersection(custom_fields.keys())
+        if invalid_keys:
+            self.log("Error", f"Custom fields contain reserved keys: {invalid_keys}")
+            return
+
+        # Create a unique transaction ID
+        with self.counter_lock:
+            txn_id = f"custom-{self.transaction_counter}"
+            self.transaction_counter += 1
+
+        # Increment the Lamport clock
+        timestamp = self.increment_clock()
+
+        # Create the transaction object
+        txn = Transaction(
+            txn_id=txn_id,
+            amount=amount,
+            sender=self.address,
+            receiver=receiver_address,
+            **custom_fields  # Pass custom fields here
+        )
+
+        # Log custom transaction creation
+        self.log("Debug", f"Processing custom transaction for receiver: {receiver_address}, amount: {amount}, custom fields: {custom_fields}")
+
+        # Deduct the amount from the sender's balance
+        self.balances[self.address] -= amount
+        self.transactions[txn.id] = txn
+
+        # Log balance deduction and transaction creation
+        self.log("Balance Deducted", f"{self.address}: New Balance: {self.balances[self.address]}")
+        self.log("Custom Transaction Created", f"{txn.id} -> {receiver_address}: {amount}, Custom: {custom_fields}")
+
+        # Broadcast the transaction
+        if self.broadcast_transaction(txn):
+            self.log("Custom Transaction Broadcast", f"Broadcasted {txn.id} to peers.")
+        else:
+            self.log("Broadcast Failed", f"Failed to broadcast {txn.id}")
+
+
     def broadcast_transaction(self, txn):
         if not self.peers:
             self.log("Warning", "No peers available to broadcast the transaction.")
@@ -273,19 +336,19 @@ class Node:
                 txn_id = txn_data.get("id")
 
                 # Validate the transaction ID format
-                if not re.match(r"^txn-\d+$", txn_id):
+                if not re.match(r"^(txn|custom)-\d+$", txn_id):
                     self.log("Transaction Rejected", f"Invalid transaction ID format: {txn_id}")
                     return
-
-                # Validate transaction data
+                
                 try:
-                    amount = float(txn_data.get("amount"))
-                    if amount <= 0:
-                        self.log("Transaction Rejected", f"Invalid transaction amount: {amount}")
-                        return
-                except ValueError:
-                    self.log("Transaction Rejected", f"Amount is not a valid number: {txn_data.get('amount')}")
-                    return
+                    txn = Transaction.from_dict(txn_data)
+                    success, msg = self.process_transaction(txn)
+                    if success:
+                        self.log("Transaction Processed", f"Transaction {txn.id}: {txn.sender} -> {txn.receiver}")
+                    else:
+                        self.log("Transaction Failed", msg)
+                except Exception as e:
+                    self.log("Transaction Error", f"Error processing transaction: {e}")
 
                 # Create the transaction object
                 txn = Transaction(**txn_data)
@@ -296,9 +359,7 @@ class Node:
                     self.log("Transaction Processed", f"Transaction {txn.id}: {txn.sender} -> {txn.receiver} : {txn.amount:.2f}")
                 else:
                     self.log("Transaction Failed", f"Transaction {txn.id}: {msg}")
-
            
-
             elif message_type == "transaction_request":
                 txn_id = message.get("data", {}).get("transaction_id")
                 if txn_id and txn_id in self.transactions:
@@ -554,11 +615,8 @@ class Node:
             if peer_address == self.address:
                 self.log("Node Stopping", f"Node {peer_address} is stopping.")
                 self.stop()
-
         else:
             self.log("Peer Not Found", f"Peer {peer_address} is not in the peer list.")
-
-
 
     def send_node_details(self, peer_address):
         """Send node details, including formatted transactions, to a peer."""
