@@ -23,6 +23,7 @@ class Transaction:
         self.sender = sender
         self.receiver = receiver
         self.timestamp = datetime.now().isoformat()
+        
 
     def to_dict(self):
         return {
@@ -57,9 +58,11 @@ class Node:
         self.peer_last_seen = {}  # Track last seen time for each peer
         threading.Thread(target=self.start_heartbeat, daemon=True).start()  # Start heartbeat
         self.counter_lock = Lock()  
+        self.synchronize_balances()     # request balance of all known peers
 
         self.recent_discoveries = set()
-
+        self.transaction_counter = len(self.transactions)
+        
         # Validate IP Address
         host, port = self.address.split(":")
         try:
@@ -97,34 +100,42 @@ class Node:
             self.log_callback(f"[{log_type}] {message}")
      
     def process_transaction(self, txn):
-        if txn.id in self.transactions:
+
+        # Check if the transaction has already been processed
+        if txn.id in self.transactions: # ignore and skip
             return False, "Transaction already processed."
 
-        # Add transaction to the processed set and local transaction log
-        self.processed_transaction_ids.add(txn.id)
-        self.transactions[txn.id] = txn
-
-        # Update receiver's balance
-        if txn.receiver in self.balances:
-            self.balances[txn.receiver] += txn.amount
-        else:
-            self.balances[txn.receiver] = txn.amount  # Create the account if it doesn't exist
-
-        # Update sender's balance
-        if txn.sender in self.balances:
-            self.balances[txn.sender] -= txn.amount
-            if self.balances[txn.sender] < 0:
-                return False, "Insufficient funds."
-        else:
+        # Validate sender's balance
+        if txn.sender not in self.balances: # ignore and skip
             return False, f"Sender account '{txn.sender}' does not exist."
 
-        self.log("Transaction Processed", f"{txn.sender} -> {txn.receiver}: {txn.amount}")
+        if self.balances[txn.sender] < txn.amount:
+            return False, "Insufficient funds."
+
+        # Process the transaction: update balances
+        self.balances[txn.sender] -= txn.amount
+        self.balances[txn.receiver] = self.balances.get(txn.receiver, 0) + txn.amount
+
+        # Add the transaction to local storage
+        self.transactions[txn.id] = txn
+        self.processed_transaction_ids.add(txn.id)
+
+        # Log successful transaction processing
+        self.log(
+            "Transaction Processed",
+            f"Transaction {txn.id}: {txn.sender} -> {txn.receiver} : {txn.amount:.2f}"
+        )
         # Synchronize with peers after processing the transaction
         self.synchronize_transactions()
 
         return True, "Transaction processed successfully."
 
-    
+    def synchronize_balances(self):
+     
+        for peer in self.peers:
+            self.request_balance(peer)
+
+
     def send_transaction(self, receiver_address, amount):
         # Prevent sending a transaction to self
         if receiver_address == self.address:
@@ -143,7 +154,7 @@ class Node:
 
         # Create a unique transaction ID
         with self.counter_lock:
-            txn_id = f"txn-{self.address}-{self.transaction_counter}"
+            txn_id = f"txn-{self.transaction_counter}"
             self.transaction_counter += 1
 
         # Increment the Lamport clock
@@ -202,7 +213,7 @@ class Node:
         self.send_udp_message("ping", {"data": "Ping"}, peer_address)
         self.log("Ping", f"Ping sent to {peer_address}")
 
-    def send_udp_message(self, message_type, data, peer_address, silent=True):
+    def send_udp_message(self, message_type, data, peer_address, silent=False):
         """Send a UDP message to a peer."""
         # Simulate message drop
         if self.failure_simulation and random.random() < self.drop_probability:
@@ -238,36 +249,103 @@ class Node:
             sender_address = f"{addr[0]}:{addr[1]}"
             message_type = message.get("type")
 
-            # Suppress logs for ping and ping_ack
+            # PING - PING-ACK
             if message_type == "ping":
-                self.peer_last_seen[sender_address] = time.time()  # Update last seen time
+            #    self.peer_last_seen[sender_address] = time.time()  # Update last seen time
                 self.add_peer(sender_address)  # Ensure the peer is added
-                self.send_udp_message("ping_ack", {"data": "Pong"}, sender_address, silent=True)
+                self.send_udp_message("ping_ack", {"data": "Pong"}, sender_address)
 
             elif message_type == "ping_ack":
                 self.peer_last_seen[sender_address] = time.time()  # Update last seen time
                 self.add_peer(sender_address)  # Ensure the peer is added
                 return  # Skip further processing
 
-            # Handle specific message types
+            # TRANSACTIONS
             if message_type == "transaction":
                 txn_data = message.get("data", {})
                 required_fields = ["id", "amount", "sender", "receiver", "timestamp"]
+                
+                # Validate that all required fields are present
                 if not all(field in txn_data for field in required_fields):
-                    self.log("Error", f"Incomplete transaction data from {sender_address}: {txn_data}")
+                    self.log("Transaction Rejected", f"Missing required fields in transaction: {txn_data}")
                     return
-                txn = Transaction(**txn_data)
-                success, msg = self.process_transaction(txn)
-                self.log("Transaction Processed" if success else "Transaction Failed", msg)
 
+                txn_id = txn_data.get("id")
+
+                # Validate the transaction ID format
+                if not re.match(r"^txn-\d+$", txn_id):
+                    self.log("Transaction Rejected", f"Invalid transaction ID format: {txn_id}")
+                    return
+
+                # Validate transaction data
+                try:
+                    amount = float(txn_data.get("amount"))
+                    if amount <= 0:
+                        self.log("Transaction Rejected", f"Invalid transaction amount: {amount}")
+                        return
+                except ValueError:
+                    self.log("Transaction Rejected", f"Amount is not a valid number: {txn_data.get('amount')}")
+                    return
+
+                # Create the transaction object
+                txn = Transaction(**txn_data)
+
+                # Process the transaction and log the outcome
+                success, msg = self.process_transaction(txn)
+                if success:
+                    self.log("Transaction Processed", f"Transaction {txn.id}: {txn.sender} -> {txn.receiver} : {txn.amount:.2f}")
+                else:
+                    self.log("Transaction Failed", f"Transaction {txn.id}: {msg}")
+
+           
+
+            elif message_type == "transaction_request":
+                txn_id = message.get("data", {}).get("transaction_id")
+                if txn_id and txn_id in self.transactions:
+                    txn = self.transactions[txn_id]
+                    self.send_udp_message(
+                        "transaction_response",
+                        txn.to_dict(),
+                        sender_address,
+                    )
+                    self.log("Transaction Response Sent", f"Sent transaction {txn_id} to {sender_address}")
+
+            elif message_type == "transaction_response":
+                txn_data = message.get("data", {})
+                txn_id = txn_data.get("id")
+
+                # Validate the received transaction data
+                if not txn_id or not all(key in txn_data for key in ["id", "amount", "sender", "receiver", "timestamp"]):
+                    self.log("Error", f"Invalid or incomplete transaction data received from {sender_address}: {txn_data}")
+                    return
+
+                # Check if the transaction already exists
+                if txn_id in self.transactions:
+                    self.log("Transaction Duplicate", f"Transaction {txn_id} already exists. Ignoring response.")
+                    return
+
+                # Add the transaction to the local store
+                txn = Transaction(**txn_data)
+                self.transactions[txn.id] = txn
+                self.log("Transaction Added", f"Transaction {txn.id} added to local store from {sender_address}")
+
+                # Check if there are any unresolved requests for this transaction
+                if txn_id in self.processed_transaction_ids:
+                    self.processed_transaction_ids.remove(txn_id)  # Mark as resolved
+                    self.log("Transaction Resolved", f"Resolved transaction request for {txn_id}.")
+
+                if self.log_callback and callable(getattr(self, "handle_transaction_response", None)):
+                    self.log_callback(f"Received transaction: {txn.to_dict()}")
+
+            # SYNC Messages
             elif message_type == "full_sync_request":
-                sync_data = {
-                    "balances": self.balances,
-                    "transactions": self.get_all_transactions(),
-                    "peers": self.peers,
-                }
-                self.send_udp_message("full_sync_response", sync_data, sender_address)
-                self.log("Full Sync Response Sent", f"Sent full sync data to {sender_address}")
+                    sync_data = {
+                        "balances": self.balances,
+                        "transactions": self.get_all_transactions(),
+                        "peers": self.peers,
+                    }
+                    self.send_udp_message("full_sync_response", sync_data, sender_address)
+                    self.log("Full Sync Response Sent", f"Sent full sync data to {sender_address}")
 
             elif message_type == "full_sync_response":
                 data = message.get("data", {})
@@ -278,6 +356,7 @@ class Node:
                 self.log("Balances", f"Updated Balances: {self.balances}")
                 self.log("Peers", f"Updated Peers: {self.peers}")
 
+            # DETAIL/DISCOVERY MESSAGES
             elif message_type == "details_request":
                 self.send_node_details(sender_address)
 
@@ -288,6 +367,8 @@ class Node:
                 self.merge_peers(message.get("data", {}).get("peers", []))
                 self.log("Discovery", f"Updated peer list from {sender_address}")
 
+
+            # BALANCE 
             elif message_type == "balance_response":
                 balance_data = message.get("data", {})
                 address = balance_data.get("address")
@@ -299,8 +380,6 @@ class Node:
                 else:
                     self.log("Error", f"Invalid balance data received from {sender_address}")
 
-
-
             elif message_type == "balance_request":
                 # Respond to the balance request
                 balance_data = {
@@ -310,6 +389,7 @@ class Node:
                 self.send_udp_message("balance_response", balance_data, sender_address)
                 self.log("Balance Response Sent", f"Sent balance to {sender_address}")
 
+            # SYNC 
             elif message_type == "sync_request":
                 sync_data = {
                     "balances": self.balances,
@@ -319,15 +399,35 @@ class Node:
                 self.send_udp_message("sync_response", sync_data, sender_address)
                 self.log("Sync Response", f"Sent sync response to {sender_address}")
 
-            if message_type == "sync_response":
+            elif message_type == "sync_response":
                 data = message.get("data", {})
                 peer_counter = data.get("transaction_counter", 0)
+                peer_transactions = data.get("transactions", [])
+                peer_balances = data.get("balances", {})
+                peer_hash = data.get("transaction_hash")  # Hash of transactions from the peer
+
+                # Update max transaction counter
                 self.max_transaction_counter = max(self.max_transaction_counter, peer_counter)
                 self.transaction_counter = max(self.transaction_counter, self.max_transaction_counter + 1)
 
-                # Merge transactions
-                self.merge_transactions(data.get("transactions", []))
-                self.log("Sync Complete", f"Synchronized with peer: {addr}")
+                self.merge_balances(peer_balances)
+                # Compare transaction hashes for consistency
+                local_hash = self.calculate_transaction_hash()
+
+                if peer_hash and peer_hash != local_hash:
+                    self.log("Sync Mismatch", f"Transaction hash mismatch with peer {sender_address}. Resolving...")
+                    self.merge_transactions(peer_transactions)
+                    updated_hash = self.calculate_transaction_hash()
+
+                    if updated_hash == peer_hash:
+                        self.log("Sync Resolved", f"Transactions synchronized successfully with {sender_address}.")
+                    else:
+                        self.log("Sync Incomplete", f"Hash mismatch persists after merging with {sender_address}.")
+                else:
+                    self.log("Sync Complete", f"Transaction hashes match with {sender_address}. No further action required.")
+
+                # Merge peers to ensure consistent network state
+                self.merge_balances(peer_balances)
 
         except json.JSONDecodeError as e:
             self.log("Error", f"Invalid JSON data received from {addr}: {data}, error: {e}")
@@ -344,28 +444,20 @@ class Node:
         """Merge transactions from peers, avoiding duplicates and validating IDs."""
         for txn_data in peer_transactions:
             txn_id = txn_data.get("id")
-            txn_counter = None
-            
-            # Extract transaction counter if ID follows 'txn-node-address-counter'
-            if txn_id.startswith("txn-") and "-" in txn_id:
-                try:
-                    txn_counter = int(txn_id.split("-")[-1])
-                except ValueError:
-                    self.log("Transaction Rejected", f"Invalid transaction ID format: {txn_id}")
-                    continue
-            else:
-                # Skip non-standard transaction IDs (e.g., UUIDs)
-                self.log("Transaction Rejected", f"Non-standard transaction ID: {txn_id}")
+
+            # Ensure the transaction ID follows the format `txn-<index>`
+            if not re.match(r"^txn-\d+$", txn_id):
+                self.log("Transaction Rejected", f"Invalid transaction ID format: {txn_id}")
                 continue
-            
-            # Validate transaction counter
-            if txn_counter is not None and txn_counter <= self.max_transaction_counter:
-                self.log("Transaction Rejected", f"Transaction ID {txn_id} has an invalid counter.")
+
+            try:
+                txn_index = int(txn_id.split("-")[1])
+            except ValueError:
+                self.log("Transaction Rejected", f"Invalid transaction ID format: {txn_id}")
                 continue
-            
+
             # Avoid duplicates
             if txn_id in self.transactions:
-                self.log("Transaction Duplicate", f"Skipped duplicate transaction ID: {txn_id}")
                 continue
             
             # Add the transaction
@@ -374,7 +466,7 @@ class Node:
             self.log("Transaction Added", f"ID: {txn.id}, Sender: {txn.sender}, Receiver: {txn.receiver}, Amount: {txn.amount}")
             
             # Update the global counter
-            self.max_transaction_counter = max(self.max_transaction_counter, txn_counter)
+       #     self.max_transaction_counter = max(self.max_transaction_counter, txn_counter)
             self.transaction_counter = max(self.transaction_counter, self.max_transaction_counter + 1)
 
 
@@ -386,8 +478,9 @@ class Node:
                 self.peers.append(peer)
                 self.peer_last_seen[peer] = time.time()  # Track last seen time
                 self.log("Peer Added", f"Added peer {peer}")
-            elif peer in self.peers:
-                self.log("Peer Exists", f"Peer {peer} already in the list. Skipping.")
+                
+                # Request balance from the new peer
+                self.send_udp_message("balance_request", {}, peer)
 
     def merge_balances(self, incoming_balances):
         for account, balance in incoming_balances.items():
@@ -405,26 +498,35 @@ class Node:
             self.log("Peer Rejected", f"Invalid peer address format: {peer_address}")
             return
 
-        # Prevent adding self or duplicates
+        # Prevent adding self
         if peer_address == self.address:
             self.log("Peer Rejected", f"Cannot add self as a peer: {peer_address}")
             return
 
+        # Prevent adding duplicates
         if peer_address in self.peers:
-          ##  self.log("Peer Exists", f"Peer {peer_address} is already in the peer list.")
+           
             return
 
+        # Prevent adding previously removed peers
         if peer_address in self.removed_peers:
-            self.log("Peer Rejected", f"Peer {peer_address} was previously removed. Ignoring.")
+            self.log("Peer Rejected", f"{peer_address} was previously removed. Ignoring.")
             return
 
-        # Add the peer if it passes all checks
+        # Add the peer
         self.peers.append(peer_address)
-        self.peer_last_seen[peer_address] = time.time()  # Initialize last seen time
+        self.peer_last_seen[peer_address] = time.time()  # Track last seen time
+
+        # Initialize the balance if it doesn't exist
+        if peer_address not in self.balances:
+            self.balances[peer_address] = 1000  # Default balance initialization
+
         self.log("Peer Added", f"{peer_address} added successfully.")
-        self.send_udp_message("ping", {"data": "Ping Test"}, peer_address, silent=True)
         # Notify existing peers about the updated peer list
-       # self.notify_peers_about_update()
+        self.notify_peers_about_update()
+        # Request balance from the added peer
+        self.request_balance(peer_address)
+        self.send_udp_message("balance_request", {}, peer_address)
 
 
     def notify_peers_about_update(self):
@@ -439,6 +541,7 @@ class Node:
 
     def remove_peer(self, peer_address):
         """Remove a peer from the network and stop the node if necessary."""
+
         if peer_address in self.peers:
             self.peers.remove(peer_address)
             self.removed_peers.add(peer_address)  # Mark the peer as removed
@@ -538,12 +641,9 @@ class Node:
         ])
 
     def handle_discovery_request(self, sender_address):
-        """Handle an incoming discovery request."""
         if sender_address in self.recent_discoveries:
-            self.log("Discovery", f"Skipped repeated discovery from {sender_address}")
             return
         if sender_address in self.removed_peers:
-            self.log("Discovery Skipped", f"Discovery request from removed peer {sender_address}")
             return  # Ignore requests from removed peers
 
         self.recent_discoveries.add(sender_address)
@@ -552,6 +652,8 @@ class Node:
 
         self.peer_last_seen[sender_address] = time.time()
         self.add_peer(sender_address)
+        # Request balance from the discovered peer
+        self.request_balance(sender_address)
 
         # Send discovery response
         MAX_PEERS_TO_SEND = 50
@@ -582,7 +684,6 @@ class Node:
 
             # Skip if the peer is already in the list or is the current node itself
             if peer_address in self.peers or peer_address == self.address:
-                self.log("Discovery Skipped", f"Skipping {peer_address} (self or already known).")
                 continue
 
             # Send discovery request
@@ -614,7 +715,6 @@ class Node:
     def request_balance(self, peer_address):
         """Request balance from a peer."""
         if not re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d+:\d+$", peer_address):
-            self.log("Error", f"Invalid peer address: {peer_address}. Format: IP:PORT")
             return
 
         # Log the balance request in a human-readable format
@@ -624,11 +724,45 @@ class Node:
         self.send_udp_message("balance_request", {}, peer_address, silent=True)
 
 
+    def calculate_transaction_hash(self):
+        """Calculate a simple hash for the current transaction list."""
+        txn_data = "".join(sorted(txn.id for txn in self.transactions.values()))
+        return hash(txn_data)
+
+    def synchronize_transactions(self):
+        """Synchronize transactions with peers and check consistency."""
+        if not self.peers:
+            self.log("Sync", "No peers available for synchronization.")
+            return
+
+        local_hash = self.calculate_transaction_hash()
+        for peer in self.peers:
+            sync_data = {
+                "transaction_hash": local_hash,
+                "transactions": self.get_all_transactions(),
+                "transaction_counter": self.transaction_counter,
+            }
+            self.send_udp_message("sync_request", sync_data, peer)
+            self.log("Sync Request Sent", f"Sent sync request to {peer}")
+
+    def get_transaction_by_index(self, index):
+        try:
+            # Convert the transactions dictionary to a list of transactions
+            transactions_list = list(self.transactions.values())
+            
+            # Retrieve the transaction at the specified index
+            if index < 0 or index >= len(transactions_list):
+                return {"error": f"Index {index} out of range. Available transactions: {len(transactions_list)}"}
+
+            transaction = transactions_list[index]
+            return transaction.to_dict()
+        except Exception as e:
+            return {"error": f"An error occurred while retrieving the transaction: {e}"}
+
 
     def join_network(self, peer_address):
         """Join a network by connecting to a known peer."""
         if peer_address in self.peers:
-            self.log("Info", f"Already connected to {peer_address}. Skipping.")
             return
 
         self.log("Join Network", f"Connecting to {peer_address}")
@@ -655,8 +789,7 @@ class Node:
             except Exception as e:
                 self.log("Error", f"Unhandled error in listening loop: {e}")
 
-
-    def start_heartbeat(self, interval=5, timeout=10):
+    def start_heartbeat(self, interval=5, timeout=15):
         """Start a periodic heartbeat to check the status of peers."""
         self.heartbeat_lock = Lock()
         self.peer_last_seen = {peer: time.time() for peer in self.peers}
@@ -676,10 +809,6 @@ class Node:
                 time.sleep(interval)
 
         threading.Thread(target=heartbeat, daemon=True).start()
-
-
-
-
 
     def clear_and_rebuild_data(self):
         # Confirm with the user before proceeding

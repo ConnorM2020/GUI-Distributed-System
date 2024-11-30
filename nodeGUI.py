@@ -42,10 +42,11 @@ class NodeGUI:
         txn_frame = tk.LabelFrame(self.master, text="Transactions", padx=5, pady=5)
         txn_frame.pack(fill="x", padx=10, pady=5)
         tk.Button(txn_frame, text="Send Transaction", command=self.send_transaction).pack(side="left", padx=5, pady=5)
+        tk.Button(txn_frame, text="Send Custom Transaction", command=self.send_custom_transaction).pack(side="left", padx=5, pady=5)
         tk.Button(txn_frame, text="List Transactions", command=self.list_transactions).pack(side="left", padx=5, pady=5)
         tk.Button(txn_frame, text="Synchronize Transactions", command=self.synchronize_transactions).pack(side="left", padx=5, pady=5)
-        tk.Button(txn_frame, text="Query Transactions", command=self.query_transactions).pack(side="left", padx=5, pady=5)
         tk.Button(txn_frame, text="Export Transactions", command=self.export_data).pack(side="left", padx=5, pady=5)
+        tk.Button(txn_frame, text="Retrieve Transaction by Index", command=self.retrieve_transaction_by_index).pack(side="left", padx=5, pady=5)
 
         # Communication
         comm_frame = tk.LabelFrame(self.master, text="Communication", padx=5, pady=5)
@@ -86,22 +87,6 @@ class NodeGUI:
             self.node.rebuild_from_network()
             self.log_message("Data cleared and rebuild request sent to the network.")
     
-    
-    def query_transactions_internal(self, sender=None, receiver=None, min_amount=None, max_amount=None):
-            results = []
-            for txn in self.transactions.values():
-                if sender and txn.sender != sender:
-                    continue
-                if receiver and txn.receiver != receiver:
-                    continue
-                if min_amount and txn.amount < min_amount:
-                    continue
-                if max_amount and txn.amount > max_amount:
-                    continue
-                results.append(txn.to_dict())
-            return results
-    
-
     def get_balances(self):
         return self.balances
 
@@ -110,19 +95,6 @@ class NodeGUI:
         formatted = "\n".join([f"{node}: {balance:.2f}" for node, balance in balances.items()])
         messagebox.showinfo("Balances", formatted)
 
-
-    def query_transactions(self):
-        sender = simpledialog.askstring("Query Transactions", "Enter sender address (optional):")
-        receiver = simpledialog.askstring("Query Transactions", "Enter receiver address (optional):")
-        min_amount = simpledialog.askfloat("Query Transactions", "Enter minimum amount (optional):")
-        max_amount = simpledialog.askfloat("Query Transactions", "Enter maximum amount (optional):")
-        results = self.node.query_transactions(sender=sender, receiver=receiver, min_amount=min_amount, max_amount=max_amount)
-        if results:
-            formatted_results = "\n".join([f"ID: {txn['id']} Sender: {txn['sender']} Receiver: {txn['receiver']} Amount: {txn['amount']} Timestamp: {txn['timestamp']}" for txn in results])
-        else:
-            formatted_results = "No transactions match the query."
-        self.show_query_results(formatted_results)
-    
     def log_message(self, message):
         self.log_display.insert(tk.END, f"{message}\n")
         self.log_display.see(tk.END)
@@ -137,16 +109,35 @@ class NodeGUI:
         tree.heading("Receiver", text="Receiver")
         tree.heading("Amount", text="Amount")
         tree.heading("Timestamp", text="Timestamp")
+        
         for txn in transactions:
             tree.insert("", tk.END, values=(txn.id, txn.sender, txn.receiver, txn.amount, txn.timestamp))
-    
-    def show_query_results(self, results):
-        result_window = tk.Toplevel(self.master)
-        result_window.title("Query Results")
-        result_text = scrolledtext.ScrolledText(result_window, wrap=tk.WORD, height=15, width=60)
-        result_text.pack(fill="both", expand=True)
-        result_text.insert(tk.END, results)
-        result_text.config(state="disabled")
+     
+    def retrieve_transaction_by_index(self):
+        try:
+            # Get the transaction index from the user
+            index = simpledialog.askinteger("Retrieve Transaction", "Enter the transaction index (0-based):")
+            if index is None:
+                return  # User canceled the input dialog
+
+            # Call the node method to retrieve the transaction
+            transaction = self.node.get_transaction_by_index(index)
+
+            # Check if the transaction was found or if there was an error
+            if "error" in transaction:
+                messagebox.showerror("Error", transaction["error"])
+            else:
+                # Display the transaction details
+                details = (
+                    f"ID: {transaction['id']}\n"
+                    f"Sender: {transaction['sender']}\n"
+                    f"Receiver: {transaction['receiver']}\n"
+                    f"Amount: {transaction['amount']}\n"
+                    f"Timestamp: {transaction['timestamp']}"
+                )
+                messagebox.showinfo("Transaction Details", details)
+        except Exception as e:
+            self.log_message(f"Error: {e}")
 
     def list_peers(self):
         peers = "\n".join(self.node.peers) if self.node.peers else "No peers connected."
@@ -172,7 +163,6 @@ class NodeGUI:
         receiver = simpledialog.askstring("Send Transaction", "Enter receiver address:")
         if not receiver:
             return
-
         try:
             amount = float(simpledialog.askstring("Send Transaction", "Enter amount:"))
             self.node.send_transaction(receiver, amount)
@@ -196,6 +186,41 @@ class NodeGUI:
         else:
             self.log_message("No transactions found.")
 
+    def send_custom_transaction(self):
+        # Prompt the user for the receiver
+        receiver = simpledialog.askstring("Send Custom Transaction", "Enter receiver address:")
+        if not receiver:
+            return
+
+        # Prompt the user for the amount
+        try:
+            amount = float(simpledialog.askstring("Send Custom Transaction", "Enter amount:"))
+        except ValueError:
+            self.log_message("Invalid amount entered.")
+            return
+
+        # Prompt the user for custom fields
+        custom_fields = {}
+        while True:
+            key = simpledialog.askstring("Custom Field", "Enter custom field name (or leave blank to finish):")
+            if not key:
+                break
+            value = simpledialog.askstring("Custom Field", f"Enter value for '{key}':")
+            if value:
+                custom_fields[key] = value
+
+        # Create and send the transaction
+        try:
+            transaction = Transaction(
+                sender=self.node.address,
+                receiver=receiver,
+                amount=amount,
+                **custom_fields  # Pass custom fields as additional arguments
+            )
+            self.node.broadcast_transaction(transaction)
+            self.log_message(f"Custom transaction sent: {transaction.to_dict()}")
+        except Exception as e:
+            self.log_message(f"Error sending custom transaction: {e}")
 
     def synchronize_transactions(self):
         self.node.synchronize_transactions()
@@ -242,6 +267,7 @@ class NodeGUI:
             self.node.send_udp_message("ping", {"data": "Ping"}, peer)
             self.log_message(f"Ping sent to {peer}")
 
+
     def get_node_details(self):
         # Create the main details window
         details_window = tk.Toplevel(self.master)
@@ -282,9 +308,6 @@ class NodeGUI:
 
         # Close button
         tk.Button(details_window, text="Close", command=details_window.destroy).pack(pady=10)
-
-
-
 
     def request_balance(self):
         peer = simpledialog.askstring("Request Balance", "Enter peer address (IP:PORT):")
@@ -347,27 +370,28 @@ class NodeGUI:
             "Peer Management:\n"
             "  - List Peers: Display all connected peers.\n"
             "  - Add Peer: Add a new peer by providing its IP:PORT.\n"
-            "  - Remove Peer: Remove an existing peer.\n"
+            "  - Remove Current Node: Remove the current node and close the application.\n"
+            "  - Remove Peer: Remove a specific peer from the network.\n"
             "  - Request Discovery: Request peer information from existing peers.\n"
-            "  - Join Network: Connect to a peer and join the network.\n\n"
+            "  - Join Network: Connect to a peer and join its network.\n\n"
             "Transactions:\n"
-            "  - Send Transaction: Send a transaction to a peer.\n"
-            "  - List Transactions: View all recorded transactions.\n"
-            "  - Query Transactions: Search transactions based on criteria.\n"
-            "  - Export Transactions: Save transactions to a CSV file.\n\n"
+            "  - Send Transaction: Create and send a transaction to a peer.\n"
+            "  - List Transactions: Display all recorded transactions in the node.\n"
+            "  - Synchronize Transactions: Sync transactions with peers to ensure consistency.\n"
+            "  - Export Transactions: Save all transactions as a CSV file.\n"
+            "  - Retrieve Transaction by Index: Fetch transaction details using a 0-based index.\n\n"
             "Communication:\n"
-            "  - Send Ping: Send a ping to a peer.\n"
-            "  - Get Node Details: View the node's details.\n"
-            "  - Request Balance: Request balance information from a peer.\n\n"
+            "  - Send Ping: Send a ping message to a peer to check connectivity.\n"
+            "  - Get Node Details: View details about the current node, including balances and peers.\n"
+            "  - Request Balance: Request the balance from a specific peer.\n\n"
             "Robot Automation:\n"
-            "  - Start Robot: Start automating transactions and pings.\n"
-            "  - Stop Robot: Stop the automation.\n"
-            "  - Configure Robot: Set automation frequency and max transaction amount.\n\n"
+            "  - Start Robot: Start automated actions like transactions and pings.\n"
+            "  - Stop Robot: Stop the automated actions.\n\n"
             "Data Management:\n"
-            "  - Clear and Rebuild Data: Clear local data and rebuild from the network.\n\n"
+            "  - Clear and Rebuild Data: Clear local data and rebuild the state from the network.\n\n"
             "Logs:\n"
-            "  - Logs display real-time activities and errors.\n"
-            "  - Use 'Clear Logs' to clear the log display.\n"
+            "  - Logs display real-time activities, actions, and errors.\n"
+            "  - Clear Logs: Clear the current log display.\n"
         )
         messagebox.showinfo("Help", help_text)
 
@@ -380,8 +404,6 @@ def start_gui(port, ip="0.0.0.0"):
 
 
 if __name__ == "__main__":
-
-
     if len(sys.argv) < 2:
         print("Usage: python nodeGUI.py <port> [<ip>]")
         sys.exit(1)
