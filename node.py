@@ -96,6 +96,16 @@ class Node:
         self.udp_socket.bind((host, int(port)))
         threading.Thread(target=self.listen, daemon=True).start()
 
+        # allow a sync to occur after each transaction occurs to ensure peer nodes note the change
+    def auto_sync_with_delay(self, delay=5):
+        def sync_task():
+            time.sleep(delay)
+            self.synchronize_transactions()
+            self.log("Auto-sync", "Synchronized transactions with peers after delay.")
+
+        # Run the sync task in a separate thread to avoid blocking the GUI
+        threading.Thread(target=sync_task, daemon=True).start()
+
     def increment_clock(self):
         self.lamport_clock += 1
         return self.lamport_clock
@@ -108,10 +118,10 @@ class Node:
             self.log_callback(f"[{log_type}] {message}")
      
     def process_transaction(self, txn):
-
         # Check if the transaction has already been processed
-        if txn.id in self.transactions: # ignore and skip
-            return False, "Transaction already processed."
+        if txn.id in self.processed_transaction_ids or txn.id in self.processed_transaction_ids:
+            self.log("Duplicate Broadcast", f"Transaction {txn.id} already broadcasted.")
+            return False
 
         # Validate sender's balance
         if txn.sender not in self.balances: # ignore and skip
@@ -121,8 +131,11 @@ class Node:
             return False, "Insufficient funds."
 
         # Process the transaction: update balances
-        self.balances[txn.sender] -= txn.amount
-        self.balances[txn.receiver] = self.balances.get(txn.receiver, 0) + txn.amount
+        with self.counter_lock:
+            self.balances[txn.sender] -= txn.amount
+            if txn.receiver not in self.balances:
+                self.log("New Account", f"Created new account for receiver: {txn.receiver}")
+            self.balances[txn.receiver] = self.balances.get(txn.receiver, 0) + txn.amount
 
         # Add the transaction to local storage
         self.transactions[txn.id] = txn
@@ -135,6 +148,7 @@ class Node:
         )
         # Synchronize with peers after processing the transaction
         self.synchronize_transactions()
+        self.synchronize_balances()
 
         return True, "Transaction processed successfully."
 
@@ -143,31 +157,25 @@ class Node:
         for peer in self.peers:
             self.request_balance(peer)
 
-
     def send_transaction(self, receiver_address, amount):
         # Prevent sending a transaction to self
         if receiver_address == self.address:
             self.log("Error", "Cannot send transaction to self.")
             return
-
         # Ensure the receiver is a valid peer
         if receiver_address not in self.peers:
             self.log("Error", f"Cannot send transaction: {receiver_address} is not a peer.")
             return
-
         # Ensure sufficient funds in the sender's account
         if self.address not in self.balances or self.balances[self.address] < amount:
             self.log("Error", "Insufficient balance in the specified account.")
             return
-
         # Create a unique transaction ID
         with self.counter_lock:
             txn_id = f"txn-{self.transaction_counter}"
             self.transaction_counter += 1
-
         # Increment the Lamport clock
         timestamp = self.increment_clock()
-
         # Create the transaction object
         txn = Transaction(
             txn_id=txn_id,
@@ -176,27 +184,23 @@ class Node:
             receiver=receiver_address,
             timestamp=timestamp,
         )
-
-        # Deduct the amount from the sender's balance
-        self.balances[self.address] -= amount
-        self.transactions[txn.id] = txn
-
-        # Log balance deduction on the sending node
-        self.log("Balance Deducted", f"{self.address}: New Balance: {self.balances[self.address]}")
-
         # Broadcast the transaction
         if self.broadcast_transaction(txn):
+            # Deduct the amount from the sender's balance after successful broadcast
+            self.balances[self.address] -= amount
+            self.transactions[txn.id] = txn
             self.log("Transaction Sent", f"{self.address} -> {receiver_address}: {amount}")
-            # Synchronize balances and transactions across the network
-            self.synchronize_transactions()
+            self.log("Balance Deducted", f"{self.address}: New Balance: {self.balances[self.address]}")
         else:
             self.log("Error", f"Failed to send transaction to {receiver_address}")
+        # Auto-sync after a delay
+        self.auto_sync_with_delay()
+
 
     def send_custom_transaction(self, receiver_address, amount, **custom_fields):
         if receiver_address == self.address:
             self.log("Error", "Cannot send transaction to self.")
             return
-
         if receiver_address not in self.peers:
             self.log("Error", f"Cannot send transaction: {receiver_address} is not a peer.")
             return
@@ -204,47 +208,38 @@ class Node:
         if self.address not in self.balances or self.balances[self.address] < amount:
             self.log("Error", "Insufficient balance.")
             return
-
         # Validate custom fields to ensure no conflicts
         reserved_fields = {"id", "amount", "sender", "receiver", "timestamp"}
         invalid_keys = reserved_fields.intersection(custom_fields.keys())
         if invalid_keys:
             self.log("Error", f"Custom fields contain reserved keys: {invalid_keys}")
             return
-
         # Create a unique transaction ID
         with self.counter_lock:
             txn_id = f"custom-{self.transaction_counter}"
             self.transaction_counter += 1
-
         # Increment the Lamport clock
         timestamp = self.increment_clock()
-
         # Create the transaction object
         txn = Transaction(
             txn_id=txn_id,
             amount=amount,
             sender=self.address,
             receiver=receiver_address,
+            timestamp=timestamp,
             **custom_fields  # Pass custom fields here
         )
-
-        # Log custom transaction creation
-        self.log("Debug", f"Processing custom transaction for receiver: {receiver_address}, amount: {amount}, custom fields: {custom_fields}")
-
-        # Deduct the amount from the sender's balance
-        self.balances[self.address] -= amount
-        self.transactions[txn.id] = txn
-
-        # Log balance deduction and transaction creation
-        self.log("Balance Deducted", f"{self.address}: New Balance: {self.balances[self.address]}")
-        self.log("Custom Transaction Created", f"{txn.id} -> {receiver_address}: {amount}, Custom: {custom_fields}")
-
         # Broadcast the transaction
         if self.broadcast_transaction(txn):
-            self.log("Custom Transaction Broadcast", f"Broadcasted {txn.id} to peers.")
+            # Deduct the amount from the sender's balance after successful broadcast
+            self.balances[self.address] -= amount
+            self.transactions[txn.id] = txn
+            self.log("Custom Transaction Sent", f"{txn.id} -> {receiver_address}: {amount}, Custom: {custom_fields}")
+            self.log("Balance Deducted", f"{self.address}: New Balance: {self.balances[self.address]}")
         else:
             self.log("Broadcast Failed", f"Failed to broadcast {txn.id}")
+        # Auto-sync after a delay
+        self.auto_sync_with_delay()
 
 
     def broadcast_transaction(self, txn):
