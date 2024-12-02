@@ -1,4 +1,3 @@
-
 import sys
 import re
 import json
@@ -10,20 +9,17 @@ import uuid
 import tkinter as tk
 import random
 import time
-
-# # Utility for formatted logging
-# def log_message(message_type, details):
-#     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {message_type}: {details}")
+import os
 
 class Transaction:
-    def __init__(self, txn_id=None, amount=None, sender=None, receiver=None, **custom_fields):
+    def __init__(self, txn_id=None, amount=None, sender=None, receiver=None, file_path = None, **custom_fields):
         self.id = txn_id or str(uuid.uuid4())
         self.amount = amount
         self.sender = sender
         self.receiver = receiver
         self.timestamp = datetime.now().isoformat()
         self.custom_fields = custom_fields
-        
+        self.file_path = file_path  # New field for binary file path
 
     def to_dict(self):
         base_dict = {
@@ -31,6 +27,7 @@ class Transaction:
             "amount": self.amount,
             "sender": self.sender,
             "receiver": self.receiver,
+            "file_path": self.file_path,  
             "timestamp": self.timestamp,
         }
         return {**base_dict, "custom_fields": self.custom_fields}
@@ -38,7 +35,7 @@ class Transaction:
     @classmethod
     def from_dict(cls, data):
         # Separate custom fields from the required fields
-        required_fields = {"id", "amount", "sender", "receiver", "timestamp"}
+        required_fields = {"id", "amount", "sender", "receiver", "timestamp", "file_path"}
         base_data = {key: data[key] for key in required_fields if key in data}
         custom_data = data.get("custom_fields", {})
         return cls(**base_data, **custom_data)
@@ -67,7 +64,8 @@ class Node:
         threading.Thread(target=self.start_heartbeat, daemon=True).start()  # Start heartbeat
         self.counter_lock = Lock()  
         self.synchronize_balances()     # request balance of all known peers
-
+        self.awaited_responses = {}  # To store awaited responses
+        self.response_lock = Lock()  # To synchronize access
         self.recent_discoveries = set()
         self.transaction_counter = len(self.transactions)
         
@@ -241,7 +239,6 @@ class Node:
         # Auto-sync after a delay
         self.auto_sync_with_delay()
 
-
     def broadcast_transaction(self, txn):
         if not self.peers:
             self.log("Warning", "No peers available to broadcast the transaction.")
@@ -300,6 +297,46 @@ class Node:
             if not silent:
                 self.log("Error", f"Failed to send message to {peer_address}: {e}")
 
+    def send_udp_message(self, message_type, data, peer_address, silent=True):
+        try:
+            # Validate peer address format
+            if not re.match(r"^\d{1,3}(\.\d{1,3}){3}:\d+$", peer_address):
+                if not silent:
+                    self.log("Error", f"Invalid peer address: {peer_address}. Expected format: IP:PORT")
+                return
+
+            # Prepare the message
+            message = {
+                "message_id": str(uuid.uuid4()),  # Unique ID for tracking messages
+                "type": message_type,
+                "data": data
+            }
+
+            # Extract the peer's host and port
+            peer_host, peer_port = peer_address.split(":")
+            peer_port = int(peer_port)
+            # Serialize the message to JSON and send it
+            self.udp_socket.sendto(json.dumps(message).encode("utf-8"), (peer_host, peer_port))
+
+            # Log the action if silent mode is not enabled
+            if not silent:
+                self.log("UDP Message Sent", f"Sent {message_type} to {peer_address} with data: {data}")
+
+        except json.JSONDecodeError as e:
+            # Log JSON encoding errors
+            if not silent:
+                self.log("Error", f"Failed to encode message to JSON: {e}")
+
+        except ValueError as e:
+            # Log value errors, like invalid port number
+            if not silent:
+                self.log("Error", f"Invalid peer address or data: {peer_address}, error: {e}")
+
+        except Exception as e:
+            # Log any other exceptions
+            if not silent:
+                self.log("Error", f"Failed to send {message_type} to {peer_address}: {e}")
+
     def handle_udp_message(self, data, addr):
         try:
             # Decode and parse the incoming JSON message
@@ -317,6 +354,75 @@ class Node:
                 self.peer_last_seen[sender_address] = time.time()  # Update last seen time
                 self.add_peer(sender_address)  # Ensure the peer is added
                 return  # Skip further processing
+
+            # File Send Request
+            if message_type == "file_transfer_request":
+                file_metadata = message.get("data", {}).get("metadata")
+                if not file_metadata or not file_metadata.get("file_name"):
+                    return
+
+                self.log("File Transfer", f"Received file transfer request from {sender_address} with metadata: {file_metadata}")
+
+                # Initialize variables for port selection
+                max_retries = 5  # Maximum number of retries to find a free port
+                listen_port = None
+
+                for _ in range(max_retries):
+                    try:
+                        proposed_port = random.randint(5000, 6000)  # Choose a random port
+                        # Test if the port is available
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as test_socket:
+                            test_socket.bind(("0.0.0.0", proposed_port))  # Bind the proposed port
+                            listen_port = proposed_port  # Mark this port as usable
+                            break  # Exit loop if port is successfully bound
+                    except OSError:
+                        self.log("Error", f"Port {proposed_port} is unavailable. Retrying...")
+
+                if listen_port is None:
+                    self.log("Error", "Failed to find a free port for file transfer after multiple attempts.")
+                    return
+
+                # Start listening for the file on the chosen port
+                threading.Thread(target=self.receive_file, args=(listen_port,), daemon=True).start()
+
+                # Respond with the chosen port for the file transfer
+                self.send_udp_message(
+                    "file_transfer_port_response",
+                    {"port": listen_port, "metadata": file_metadata},
+                    sender_address
+                )
+                self.log("File Transfer", f"Responded with file transfer port {listen_port} to {sender_address}")
+           
+            # File Accept (Start Sending File)
+            elif message_type == "file_accept":
+                file_name = message.get("data", {}).get("file_name")
+                if file_name:
+                    self.log("File Transfer", f"{sender_address} accepted the file transfer for '{file_name}'")
+                    threading.Thread(target=self.send_file, args=(file_name, sender_address), daemon=True).start()
+
+            # Handle file transfer port response
+            elif message_type == "file_transfer_port_response":
+                response_data = message.get("data", {})
+                peer_port = response_data.get("port")
+                file_metadata = response_data.get("metadata")
+                self.log("File Transfer", f"Received file metadata: {file_metadata}")
+
+                if not response_data:
+                    return
+                if not peer_port:
+                    return
+
+                self.log(
+                    "File Transfer",
+                    f"Received file transfer port {peer_port} from {sender_address} with metadata {file_metadata}"
+                )
+
+                # Proceed to send the file using the provided port
+                if peer_port:
+                    file_path = file_metadata.get("file_path")  # Ensure file path is known
+                    if file_path:
+                        self.send_file(file_path, f"{addr[0]}:{peer_port}")
+                   
 
             # TRANSACTIONS
             if message_type == "transaction":
@@ -423,7 +529,6 @@ class Node:
                 self.merge_peers(message.get("data", {}).get("peers", []))
                 self.log("Discovery", f"Updated peer list from {sender_address}")
 
-
             # BALANCE 
             elif message_type == "balance_response":
                 balance_data = message.get("data", {})
@@ -491,10 +596,8 @@ class Node:
         except Exception as e:
             self.log("Error", f"Handling message from {addr}: {e}")
 
-
     def get_all_transactions(self):
         return [txn.to_dict() for txn in self.transactions.values()]
-
 
     def merge_transactions(self, peer_transactions):
         """Merge transactions from peers, avoiding duplicates and validating IDs."""
@@ -520,12 +623,9 @@ class Node:
             txn = Transaction(**txn_data)
             self.transactions[txn.id] = txn
             self.log("Transaction Added", f"ID: {txn.id}, Sender: {txn.sender}, Receiver: {txn.receiver}, Amount: {txn.amount}")
-            
-            # Update the global counter
-       #     self.max_transaction_counter = max(self.max_transaction_counter, txn_counter)
             self.transaction_counter = max(self.transaction_counter, self.max_transaction_counter + 1)
-
-
+             # Refresh the GUI after merging
+            self.list_transactions()
 
     def merge_peers(self, incoming_peers):
         """Merge a list of incoming peers, avoiding duplicates and redundant updates."""
@@ -723,26 +823,40 @@ class Node:
             self.log("Error", f"Invalid balance data received from {sender_address}")
 
 
-    def request_discovery(self, port_range=(5001, 5010)):
+    def request_discovery(self, peer_ips):
         """
-        Discover peers on the specified IP address within a range of ports.
-        :param port_range: Tuple of (start_port, end_port) to scan for peers.
+        Sends a discovery request to the specified peer IPs.
+        :param peer_ips: List of peer IPs or IP:PORT combinations.
         """
-        start_port, end_port = port_range
-        ip = self.address.split(":")[0]  # Extract IP from the node's address
-        self.log("Discovery", f"Starting discovery on IP {ip} in port range {start_port}-{end_port}.")
+        for ip in peer_ips:
+            try:
+                # Split IP and port if provided, or use default port
+                if ":" in ip:
+                    host, port = ip.split(":")
+                    port = int(port)
+                else:
+                    host = ip
+                    port = 5001  # Default port if not specified
 
-        for port in range(start_port, end_port + 1):
-            peer_address = f"{ip}:{port}"
+                # Validate the IP address format
+                try:
+                    socket.inet_aton(host)  # Validate host
+                except socket.error:
+                    raise ValueError(f"Invalid IP address: {host}")
 
-            # Skip if the peer is already in the list or is the current node itself
-            if peer_address in self.peers or peer_address == self.address:
-                continue
+                peer_address = f"{host}:{port}"
 
-            # Send discovery request
-            self.send_udp_message("discovery_request", {}, peer_address)
-            self.log("Discovery Request Sent", f"Sent discovery request to {peer_address}")
+                # Skip if the peer is already connected or is the current node itself
+                if peer_address in self.peers or peer_address == self.address:
+                    self.log("Discovery Skipped", f"Peer {peer_address} is already connected or is self.")
+                    continue
 
+                # Send a discovery request to the peer
+                self.send_udp_message("discovery_request", {}, peer_address)
+                self.log("Discovery Request Sent", f"Sent discovery request to {peer_address}")
+
+            except Exception as e:
+                self.log("Discovery Error", f"Error discovering peer {ip}: {e}")
 
     def synchronize_transactions(self):
         if not self.peers:
@@ -812,6 +926,120 @@ class Node:
         except Exception as e:
             return {"error": f"An error occurred while retrieving the transaction: {e}"}
 
+    def send_file(self, file_path, peer_address, max_retries=3):
+        """Send a file to a peer via TCP with multiple retry attempts."""
+        try:
+            if not os.path.exists(file_path):
+                self.log("Error", f"File {file_path} does not exist.")
+                return
+
+            # Read file data
+            with open(file_path, "rb") as file:
+                file_data = file.read()
+
+            # Extract file metadata
+            file_metadata = {
+                "file_name": os.path.basename(file_path),
+                "file_size": os.path.getsize(file_path),
+            }
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    # Send a file transfer request to the peer
+                    self.send_udp_message("file_transfer_request", {"metadata": file_metadata}, peer_address)
+                    self.log("File Transfer", f"Attempt {attempt}: Requesting file transfer to {peer_address}")
+
+                    # Wait for a response with the port for file transfer
+                    response = self.await_response("file_transfer_port_response", peer_address)
+                    if not response or "port" not in response:
+                        raise ValueError(f"Invalid or missing port in response: {response}")
+
+                    # Retrieve the port and establish a direct connection
+                    peer_port = response["port"]
+                    peer_host, _ = peer_address.split(":")
+                    
+                    for tcp_attempt in range(1, max_retries + 1):
+                        try:
+                            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_socket:
+                                self.log("TCP Connection", f"Attempt {tcp_attempt}: Connecting to {peer_host}:{peer_port}")
+                                tcp_socket.connect((peer_host, peer_port))
+                                tcp_socket.sendall(file_data)
+                            self.log("File Sent", f"File {file_path} successfully sent to {peer_address}")
+                            return  # Exit if successful
+                        except Exception as tcp_error:
+                            self.log("Error", f"Attempt {tcp_attempt}: TCP connection failed: {tcp_error}")
+                            if tcp_attempt == max_retries:
+                                raise
+
+                except Exception as udp_error:
+                    self.log("Error", f"Attempt {attempt}: Failed to get response from {peer_address}: {udp_error}")
+                    if attempt == max_retries:
+                        raise
+
+        except Exception as e:
+            self.log("Error", f"Failed to send file {file_path} to {peer_address}: {e}")
+
+
+    def send_file_request(self, file_path, receiver_address):
+        """Send a file transfer request to a peer."""
+        if not os.path.exists(file_path):
+            self.log("Error", f"File {file_path} does not exist.")
+            return
+
+        # Extract file metadata
+        file_metadata = {
+            "file_path": file_path,
+            "file_name": os.path.basename(file_path),
+            "file_size": os.path.getsize(file_path),
+        }
+        self.send_udp_message("file_transfer_request", {"metadata": file_metadata}, receiver_address)
+
+        self.log("File Transfer", f"Requesting file transfer to {receiver_address} with metadata {file_metadata}")
+
+    def handle_file_reception(self, client_socket, addr):
+        """Receive a file sent by a peer and save it locally."""
+        try:
+            file_data = b""  # Initialize an empty bytes object to store the received data
+            while chunk := client_socket.recv(4096):  # Receive data in chunks of 4096 bytes
+                file_data += chunk
+            
+            # Save the received data to a file
+            file_path = f"received_file_{uuid.uuid4().hex}.dat"  # Save with a unique name
+            with open(file_path, "wb") as file:
+                file.write(file_data)
+            
+            self.log("File Received", f"File received from {addr} and saved as {file_path}")
+        except Exception as e:
+            self.log("Error", f"Failed to receive file from {addr}: {e}")
+        finally:
+            client_socket.close()  # Close the client connection
+
+    def await_response(self, expected_type, peer_address, timeout=10):
+        """Wait for a specific type of response from a specific peer."""
+        self.udp_socket.settimeout(timeout)  # Set the timeout for the socket
+        try:
+            start_time = time.time()  # Record the start time
+            while time.time() - start_time < timeout:
+                data, addr = self.udp_socket.recvfrom(4096)  # Receive data from the socket
+                # Convert addr tuple to string format (e.g., "192.168.0.32:5003")
+                sender_address = f"{addr[0]}:{addr[1]}"
+                # Check if the sender matches the expected peer
+                if sender_address == peer_address:
+                    message = json.loads(data.decode("utf-8"))  # Decode JSON message
+                    if message.get("type") == expected_type:  # Check message type
+                        return message.get("data")  # Return the data if type matches
+        except socket.timeout:
+            self.log("Error", f"Timeout waiting for {expected_type} from {peer_address}")  # Handle timeout
+        except Exception as e:
+            self.log("Error", f"Unexpected error while waiting for {expected_type} from {peer_address}: {e}")
+        return None  # Return None if no matching response is received
+
+
+
+    def broadcast_udp_message(self, message_type, data):
+        """Broadcast a UDP message to all connected peers."""
+        for peer in self.peers:
+            self.send_udp_message(message_type, data, peer)
 
     def join_network(self, peer_address):
         """Join a network by connecting to a known peer."""
@@ -819,15 +1047,74 @@ class Node:
             return
 
         self.log("Join Network", f"Connecting to {peer_address}")
-   
         self.add_peer(peer_address)
 
         # Request discovery from the new peer
         self.send_udp_message("discovery_request", {}, peer_address)
-
         # Synchronize transactions and balances after discovery
-        self.log("Join Network", f"Requesting synchronization from {peer_address}")
+      
         self.send_udp_message("sync_request", {}, peer_address)
+        self.send_udp_message("full_sync_request", {}, peer_address)
+        self.log("Join Network", f"Requesting synchronization from {peer_address}")
+
+    def send_file_to_peer(self, file_path, peer_address):
+        """Send a file to a peer using peer-to-peer communication."""
+        try:
+            # Ensure the file exists
+            if not os.path.exists(file_path):
+                self.log("Error", f"File {file_path} does not exist.")
+                return
+
+            # Prepare file metadata to send in the request
+            file_metadata = {
+                "file_name": os.path.basename(file_path),  # Extract just the file name
+                "file_size": os.path.getsize(file_path)  # Add file size for reference
+            }
+
+            # Send a file transfer request to the peer
+            self.send_udp_message("file_transfer_request", file_metadata, peer_address)
+            self.log("File Transfer", f"Sent file transfer request to {peer_address}")
+
+            # Wait for a response with the port for file transfer
+            response = self.await_response("file_transfer_port_response", peer_address)
+
+            # Retrieve the port and establish a direct connection
+            peer_port = response["port"]
+            peer_host, _ = peer_address.split(":")
+
+            # Read the file data
+            with open(file_path, "rb") as file:
+                file_data = file.read()
+
+            # Establish a TCP connection and send the file
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_socket:
+                tcp_socket.connect((peer_host, peer_port))
+                tcp_socket.sendall(file_data)
+
+            self.log("File Sent", f"File {file_path} sent to {peer_host}:{peer_port}")
+
+        except Exception as e:
+            self.log("Error", f"Failed to send file {file_path} to {peer_address}: {e}")
+
+
+
+    def receive_file(self, port):
+        """Receive a file from a peer using a direct TCP connection."""
+        def server():
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_socket:
+                tcp_socket.bind(("0.0.0.0", port))  # Bind to specified port
+                tcp_socket.listen(1)
+                self.log("File Receiver", f"Listening for file transfers on port {port}")
+
+                while self.running:
+                    try:
+                        client_socket, addr = tcp_socket.accept()
+                        threading.Thread(target=self.handle_file_reception, args=(client_socket, addr), daemon=True).start()
+                    except Exception as e:
+                        self.log("Error", f"File reception error: {e}")
+                        break
+
+        threading.Thread(target=server, daemon=True).start()
 
     def listen(self):
         while self.running:
@@ -917,8 +1204,6 @@ class Node:
             self.log("Node", "Node stopped gracefully.")
         except Exception as e:
             self.log("Error", f"Failed to close socket: {e}")
-
-
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

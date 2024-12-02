@@ -6,6 +6,7 @@ import time
 import random
 import csv
 import sys
+import requests
 from node import Node
 from node import Node, Transaction
 from tkinter import filedialog
@@ -67,6 +68,12 @@ class NodeGUI:
         data_frame.pack(fill="x", padx=10, pady=5)
         tk.Button(data_frame, text="Clear and Rebuild Data", command=self.clear_and_rebuild_data).pack(side="left", padx=5, pady=5)
 
+
+         # File Transfer Section
+        file_transfer_frame = tk.LabelFrame(self.master, text="File Transfers", padx=5, pady=5)
+        file_transfer_frame.pack(fill="x", padx=10, pady=5)
+        tk.Button(file_transfer_frame, text="Send File", command=self.send_file_gui).pack(side="left", padx=5, pady=5)
+
         # Log area
         log_frame = tk.LabelFrame(self.master, text="Logs", padx=5, pady=5)
         log_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -81,6 +88,26 @@ class NodeGUI:
         menu.add_cascade(label="Help", menu=help_menu)
         self.master.config(menu=menu)
 
+
+    def send_file_gui(self):
+        """GUI method to send a file."""
+        file_path = filedialog.askopenfilename(title="Select File to Send")
+        if not file_path:
+            self.log_message("File Transfer Cancelled")
+            return
+
+        receiver = simpledialog.askstring("Send File", "Enter receiver address (IP:PORT):")
+        if not receiver:
+            self.log_message("Receiver address not provided.")
+            return
+
+        try:
+            self.node.send_file(file_path, receiver)
+            self.log_message(f"File {file_path} sent to {receiver}")
+        except Exception as e:
+            self.log_message(f"Error: {e}")
+
+            
     def clear_and_rebuild_data(self):
         confirm = messagebox.askyesno("Clear Data", "Are you sure you want to clear all local data and rebuild from the network?")
         if confirm:
@@ -90,7 +117,26 @@ class NodeGUI:
     
     def get_balances(self):
         return self.balances
-    
+
+    def send_transaction_with_file(self):
+        """Send a transaction with a linked file."""
+        receiver = simpledialog.askstring("Send Transaction", "Enter receiver address:")
+        if not receiver:
+            return
+        try:
+            amount = float(simpledialog.askstring("Send Transaction", "Enter amount:"))
+            file_path = filedialog.askopenfilename(title="Select File to Attach")
+            txn = Transaction(amount=amount, sender=self.node.address, receiver=receiver, file_path=file_path)
+
+            # Add the transaction to local records
+            self.node.transactions[txn.id] = txn
+            self.node.broadcast_transaction(txn)
+            self.node.send_file(file_path, receiver)
+            self.log_message(f"Transaction with file sent to {receiver} with amount {amount}. File: {file_path}")
+        except ValueError:
+            self.log_message("Invalid amount entered.")
+
+
     def show_balances(self):
         balances = self.get_balances()
         formatted = "\n".join([f"{node}: {balance:.2f}" for node, balance in balances.items()])
@@ -163,8 +209,19 @@ class NodeGUI:
             self.log_message(f"Added peer: {peer}")
 
     def request_discovery(self):
-        self.node.request_discovery()
-        self.log_message("Requested discovery from peers.")
+        """
+        GUI method to request discovery from peers by providing their IPs.
+        """
+        user_input = simpledialog.askstring("Request Discovery", "Enter discovery nodes (comma-separated IPs):")
+        if user_input:
+            try:
+                # Parse the IPs and validate
+                peer_ips = [ip.strip() for ip in user_input.split(",") if ip.strip()]
+                self.node.request_discovery(peer_ips)  # Pass the list of IPs
+                self.log_message(f"Requested discovery from: {', '.join(peer_ips)}")
+            except Exception as e:
+                self.log_message(f"Error during discovery: {e}")
+
 
     def join_network(self):
         peer = simpledialog.askstring("Join Network", "Enter peer address (IP:PORT):")
@@ -198,7 +255,8 @@ class NodeGUI:
             self.log_message(f"Transactions:\n{formatted_transactions}")
         else:
             self.log_message("No transactions found.")
-
+        self.display_transactions(transactions)
+        
     def send_custom_transaction_gui(self):
         receiver = simpledialog.askstring("Send Custom Transaction", "Enter receiver address:")
         if not receiver:
