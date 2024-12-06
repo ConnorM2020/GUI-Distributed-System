@@ -35,7 +35,7 @@ class Transaction:
     @classmethod
     def from_dict(cls, data):
         # Separate custom fields from the required fields
-        required_fields = {"id", "amount", "sender", "receiver", "timestamp", "file_path"}
+        required_fields = {"id", "amount", "sender", "receiver", "timestamp", "file_path", "custom data"}
         base_data = {key: data[key] for key in required_fields if key in data}
         custom_data = data.get("custom_fields", {})
         return cls(**base_data, **custom_data)
@@ -151,7 +151,6 @@ class Node:
         return True, "Transaction processed successfully."
 
     def synchronize_balances(self):
-     
         for peer in self.peers:
             self.request_balance(peer)
 
@@ -684,7 +683,6 @@ class Node:
         self.request_balance(peer_address)
         self.send_udp_message("balance_request", {}, peer_address)
 
-
     def notify_peers_about_update(self):
         """Notify all peers about the updated peer list."""
         for peer in self.peers:
@@ -694,24 +692,28 @@ class Node:
             except Exception as e:
                 self.log("Error", f"Failed to notify peer {peer} about updated peer list: {e}")
 
-
     def remove_peer(self, peer_address):
-        """Remove a peer from the network and stop the node if necessary."""
+        """
+        Remove a peer from the peer list and notify the remaining peers.
+        """
+        if peer_address == self.address:
+            self.log("Error", "Cannot remove self as a peer.")
+            return
 
         if peer_address in self.peers:
+            # Remove the peer from the list
             self.peers.remove(peer_address)
-            self.removed_peers.add(peer_address)  # Mark the peer as removed
-            self.log("Peer Removed", f"{peer_address} removed from peers.")
-            # Notify remaining peers about the updated peer list
+            self.removed_peers.add(peer_address)  # Mark as removed to prevent re-adding
+            self.log("Peer Removed", f"Peer {peer_address} removed successfully.")
+
+            # Notify the remaining peers about the updated peer list
             for peer in self.peers:
                 self.send_udp_message("discovery_response", {"peers": self.peers}, peer)
+                self.log("Peer Notification", f"Notified {peer} about updated peer list.")
 
-            # Stop the peer node if it's the current node
-            if peer_address == self.address:
-                self.log("Node Stopping", f"Node {peer_address} is stopping.")
-                self.stop()
         else:
             self.log("Peer Not Found", f"Peer {peer_address} is not in the peer list.")
+
 
     def send_node_details(self, peer_address):
         """Send node details, including formatted transactions, to a peer."""
@@ -722,6 +724,7 @@ class Node:
                 "Receiver": txn.receiver,
                 "Amount": txn.amount,
                 "Time": txn.timestamp,
+                "Custom Fields": txn.custom_fields
             }
             for txn in self.transactions.values()
         ]
@@ -890,7 +893,6 @@ class Node:
         # Send the balance request without logging raw JSON
         self.send_udp_message("balance_request", {}, peer_address, silent=True)
 
-
     def calculate_transaction_hash(self):
         """Calculate a simple hash for the current transaction list."""
         txn_data = "".join(sorted(txn.id for txn in self.transactions.values()))
@@ -1021,7 +1023,7 @@ class Node:
             start_time = time.time()  # Record the start time
             while time.time() - start_time < timeout:
                 data, addr = self.udp_socket.recvfrom(4096)  # Receive data from the socket
-                # Convert addr tuple to string format (e.g., "192.168.0.32:5003")
+                
                 sender_address = f"{addr[0]}:{addr[1]}"
                 # Check if the sender matches the expected peer
                 if sender_address == peer_address:
@@ -1033,8 +1035,6 @@ class Node:
         except Exception as e:
             self.log("Error", f"Unexpected error while waiting for {expected_type} from {peer_address}: {e}")
         return None  # Return None if no matching response is received
-
-
 
     def broadcast_udp_message(self, message_type, data):
         """Broadcast a UDP message to all connected peers."""
@@ -1064,13 +1064,11 @@ class Node:
             if not os.path.exists(file_path):
                 self.log("Error", f"File {file_path} does not exist.")
                 return
-
             # Prepare file metadata to send in the request
             file_metadata = {
                 "file_name": os.path.basename(file_path),  # Extract just the file name
                 "file_size": os.path.getsize(file_path)  # Add file size for reference
             }
-
             # Send a file transfer request to the peer
             self.send_udp_message("file_transfer_request", file_metadata, peer_address)
             self.log("File Transfer", f"Sent file transfer request to {peer_address}")
@@ -1095,8 +1093,6 @@ class Node:
 
         except Exception as e:
             self.log("Error", f"Failed to send file {file_path} to {peer_address}: {e}")
-
-
 
     def receive_file(self, port):
         """Receive a file from a peer using a direct TCP connection."""
@@ -1162,7 +1158,6 @@ class Node:
         # Log the start of the process
         self.log("Data Management", "Clearing local transactions, balances, and peers.")
 
-        # Backup the current list of peers (optional for debugging/logging purposes)
         current_peers = self.peers.copy()
 
         # Clear local state

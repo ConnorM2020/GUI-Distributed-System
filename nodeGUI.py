@@ -171,7 +171,6 @@ class NodeGUI:
 
         tk.Button(table_window, text="Close", command=table_window.destroy).pack(pady=5)
 
-
     def retrieve_transaction_by_index(self):
         try:
             # Get the transaction index from the user
@@ -209,9 +208,6 @@ class NodeGUI:
             self.log_message(f"Added peer: {peer}")
 
     def request_discovery(self):
-        """
-        GUI method to request discovery from peers by providing their IPs.
-        """
         user_input = simpledialog.askstring("Request Discovery", "Enter discovery nodes (comma-separated IPs):")
         if user_input:
             try:
@@ -290,14 +286,13 @@ class NodeGUI:
     def remove_peer(self):
             """Remove a peer and close the GUI if the node is being removed."""
             peer = simpledialog.askstring("Remove Peer", "Enter peer address (IP:PORT):")
-            if peer in self.node.peers:
+            if peer == self.node.address:
+                self.log_message("Node is being removed. Closing GUI.")
+                self.node.stop()  # Stop the node's operations
+
+            elif peer in self.node.peers:
                 self.node.remove_peer(peer)
                 self.log_message(f"Removed peer: {peer}")
-
-                # If the current node is being removed, stop and close the window
-                if peer == self.node.address:
-                    self.log_message("Node is being removed. Closing GUI.")
-                    self.node.stop()  # Stop the node's operations
                 if hasattr(self.master, 'destroy'):
                     self.master.destroy()  # Destroy the main Tkinter window
                 elif hasattr(self.master, 'quit'):
