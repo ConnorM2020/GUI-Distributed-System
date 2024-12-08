@@ -283,22 +283,35 @@ class NodeGUI:
             self.node.synchronize_transactions()
             self.log_message("Synchronized transactions with peers.")
         
-    def remove_peer(self):
-            """Remove a peer and close the GUI if the node is being removed."""
-            peer = simpledialog.askstring("Remove Peer", "Enter peer address (IP:PORT):")
-            if peer == self.node.address:
-                self.log_message("Node is being removed. Closing GUI.")
-                self.node.stop()  # Stop the node's operations
 
-            elif peer in self.node.peers:
-                self.node.remove_peer(peer)
-                self.log_message(f"Removed peer: {peer}")
-                if hasattr(self.master, 'destroy'):
-                    self.master.destroy()  # Destroy the main Tkinter window
-                elif hasattr(self.master, 'quit'):
-                    self.master.quit()  # Fallback to quit if destroy is unavailable
-            else:
-                self.log_message(f"Peer not found: {peer}")
+    def remove_peer(self):
+        """Remove a peer from self.node.peers and reject their messages."""
+        # Prompt the user for the peer address
+        peer = simpledialog.askstring("Remove Peer", "Enter peer address (IP:PORT):").strip()
+        print(f"Peer node wanting to remove: {peer}")
+        if not peer:  # Check if peer is None or an empty string
+            self.log_message("Peer address cannot be empty.\n")
+            return
+        
+        if peer in self.node.peers:
+            self.node.peers.remove(peer)  
+            self.log_message(f"Peer {peer} successfully removed from the network.")
+
+            # Modify handle_udp_message to reject messages from removed peers
+            def updated_handle_udp_message(data, addr):
+                sender_address = f"{addr[0]}:{addr[1]}"
+                if sender_address == peer:
+                    return
+                self.node.handle_udp_message(data, addr)
+
+            # Replace the original message handler with the updated one
+            self.node.handle_udp_message = updated_handle_udp_message
+
+            self.log_message(f"Messages from {peer} will now be rejected.")
+            print(f"Updated message handling to reject messages from {peer}.")
+        else:
+            self.log_message(f"Peer {peer} not found in the network.")
+
 
     def remove_current_node(self):
         """Remove the current node and close the GUI."""

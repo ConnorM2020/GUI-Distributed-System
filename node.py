@@ -55,11 +55,9 @@ class Node:
         self.failure_simulation = False  # Simulate failures (True to enable)
         self.drop_probability = 0.3     # 30% chance of dropping messages
         self.processed_transaction_ids = set()
-        self.removed_peers = set()
         self.balances = {self.address: 1000.0}
         self.transaction_counter = 0  # Global counter for transaction IDs
         self.max_transaction_counter = 0  # Track the highest counter seen in the network
-        self.removed_peers = set()  # Track removed peers
         self.peer_last_seen = {}  # Track last seen time for each peer
         threading.Thread(target=self.start_heartbeat, daemon=True).start()  # Start heartbeat
         self.counter_lock = Lock()  
@@ -342,7 +340,7 @@ class Node:
             message = json.loads(data.decode("utf-8"))
             sender_address = f"{addr[0]}:{addr[1]}"
             message_type = message.get("type")
-
+            
             # PING - PING-ACK
             if message_type == "ping":
             #    self.peer_last_seen[sender_address] = time.time()  # Update last seen time
@@ -660,12 +658,6 @@ class Node:
 
         # Prevent adding duplicates
         if peer_address in self.peers:
-           
-            return
-
-        # Prevent adding previously removed peers
-        if peer_address in self.removed_peers:
-            self.log("Peer Rejected", f"{peer_address} was previously removed. Ignoring.")
             return
 
         # Add the peer
@@ -703,7 +695,6 @@ class Node:
         if peer_address in self.peers:
             # Remove the peer from the list
             self.peers.remove(peer_address)
-            self.removed_peers.add(peer_address)  # Mark as removed to prevent re-adding
             self.log("Peer Removed", f"Peer {peer_address} removed successfully.")
 
             # Notify the remaining peers about the updated peer list
@@ -799,8 +790,6 @@ class Node:
     def handle_discovery_request(self, sender_address):
         if sender_address in self.recent_discoveries:
             return
-        if sender_address in self.removed_peers:
-            return  # Ignore requests from removed peers
 
         self.recent_discoveries.add(sender_address)
         if len(self.recent_discoveries) > 100:  # Limit cache size
@@ -1164,8 +1153,6 @@ class Node:
         self.transactions.clear()
         self.balances = {self.address: 1000.0}  # Reset balance for the node's address
         self.peers = []  # Clear peer list
-        self.removed_peers.update(current_peers)  # Mark all current peers as removed
-
         # Log the state after clearing
         self.log("Data Management", "Local state cleared. Preventing rejoining of peers.")
 
